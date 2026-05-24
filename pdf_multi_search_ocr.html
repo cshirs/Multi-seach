@@ -1,0 +1,533 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0">
+<title>PDF Multi-Search + OCR</title>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+
+<style>
+body{
+margin:0;
+font-family:Arial,sans-serif;
+background:#525659;
+color:white;
+overflow:hidden;
+}
+
+#upload-screen{
+position:fixed;
+inset:0;
+display:flex;
+flex-direction:column;
+align-items:center;
+justify-content:center;
+gap:20px;
+}
+
+#upload-box{
+padding:40px;
+border:2px dashed rgba(255,255,255,0.4);
+border-radius:14px;
+cursor:pointer;
+text-align:center;
+background:rgba(255,255,255,0.08);
+}
+
+#file-input{
+display:none;
+}
+
+#viewer{
+display:none;
+height:100vh;
+overflow:auto;
+padding:10px;
+}
+
+.page-wrap{
+position:relative;
+margin:auto auto 10px;
+box-shadow:0 2px 12px rgba(0,0,0,0.5);
+}
+
+.hl-layer{
+position:absolute;
+top:0;
+left:0;
+pointer-events:none;
+}
+
+#search-bar{
+position:fixed;
+top:10px;
+right:10px;
+background:white;
+color:black;
+padding:10px;
+border-radius:12px;
+width:320px;
+z-index:999;
+box-shadow:0 4px 20px rgba(0,0,0,0.4);
+}
+
+#tags{
+display:flex;
+flex-wrap:wrap;
+gap:5px;
+margin-top:8px;
+}
+
+.tag{
+padding:5px 8px;
+border-radius:12px;
+font-size:12px;
+font-weight:bold;
+}
+
+button{
+cursor:pointer;
+}
+
+#kw-input{
+width:100%;
+padding:8px;
+margin-top:8px;
+}
+
+#btn-go{
+margin-top:10px;
+width:100%;
+padding:10px;
+background:#e05c3a;
+color:white;
+border:none;
+border-radius:8px;
+font-weight:bold;
+}
+
+#match-row{
+display:flex;
+gap:6px;
+margin-top:10px;
+align-items:center;
+}
+
+#match-label{
+flex:1;
+font-size:13px;
+}
+
+#prog{
+position:fixed;
+top:0;
+left:0;
+height:3px;
+width:0;
+background:#4a90d9;
+z-index:1000;
+}
+</style>
+</head>
+
+<body>
+
+<div id="prog"></div>
+
+<div id="upload-screen">
+<h1>PDF Multi-Search + OCR</h1>
+
+<div id="upload-box"
+onclick="document.getElementById('file-input').click()">
+📄<br><br>
+Tap to open PDF
+</div>
+
+<input type="file" id="file-input" accept=".pdf">
+</div>
+
+<div id="search-bar" style="display:none">
+
+<input type="text" id="kw-input" placeholder="Add keyword">
+<button onclick="addKW()">Add Keyword</button>
+
+<div id="tags"></div>
+
+<button id="btn-go" disabled>
+Search
+</button>
+
+<div id="match-row">
+<span id="match-label"></span>
+<button onclick="nav(-1)">↑</button>
+<button onclick="nav(1)">↓</button>
+</div>
+
+</div>
+
+<div id="viewer"></div>
+
+<script>
+pdfjsLib.GlobalWorkerOptions.workerSrc =
+'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+
+const PALETTE = [
+{bg:'#FFD700',fg:'#000',hl:'rgba(255,215,0,0.45)'},
+{bg:'#FF6B6B',fg:'#fff',hl:'rgba(255,107,107,0.45)'},
+{bg:'#4ecdc4',fg:'#000',hl:'rgba(78,205,196,0.45)'}
+];
+
+let pdfDoc=null;
+let keywords=[];
+let allMatches=[];
+let curMatch=-1;
+let pageCanvases=[];
+
+const textCacheMap={};
+const ocrTextCache={};
+
+const $=id=>document.getElementById(id);
+
+$('file-input').addEventListener('change',e=>{
+if(e.target.files[0]) loadPDF(e.target.files[0]);
+});
+
+async function loadPDF(file){
+
+const buf=await file.arrayBuffer();
+
+pdfDoc=await pdfjsLib.getDocument({
+data:buf
+}).promise;
+
+$('upload-screen').style.display='none';
+$('viewer').style.display='block';
+$('search-bar').style.display='block';
+
+await buildPages();
+updateGo();
+}
+
+async function buildPages(){
+
+$('viewer').innerHTML='';
+pageCanvases=[];
+
+const containerW=window.innerWidth-30;
+
+for(let p=1;p<=pdfDoc.numPages;p++){
+
+const page=await pdfDoc.getPage(p);
+
+const baseVP=page.getViewport({scale:1});
+const scale=containerW/baseVP.width;
+
+const vp=page.getViewport({scale});
+
+const wrap=document.createElement('div');
+wrap.className='page-wrap';
+
+const canvas=document.createElement('canvas');
+canvas.width=vp.width;
+canvas.height=vp.height;
+
+const hlCanvas=document.createElement('canvas');
+hlCanvas.width=vp.width;
+hlCanvas.height=vp.height;
+hlCanvas.className='hl-layer';
+
+wrap.appendChild(canvas);
+wrap.appendChild(hlCanvas);
+
+$('viewer').appendChild(wrap);
+
+await page.render({
+canvasContext:canvas.getContext('2d'),
+viewport:vp
+}).promise;
+
+pageCanvases.push({
+wrap,
+canvas,
+hlCanvas,
+vp
+});
+}
+}
+
+function addKW(){
+
+const v=$('kw-input').value.trim();
+
+if(!v) return;
+
+keywords.push({
+text:v,
+color:PALETTE[keywords.length%PALETTE.length]
+});
+
+$('kw-input').value='';
+
+renderTags();
+updateGo();
+}
+
+function renderTags(){
+
+$('tags').innerHTML='';
+
+keywords.forEach((kw,i)=>{
+
+const t=document.createElement('div');
+
+t.className='tag';
+t.style.background=kw.color.bg;
+t.style.color=kw.color.fg;
+
+t.innerHTML=kw.text+
+' <span onclick="removeKW('+i+')">×</span>';
+
+$('tags').appendChild(t);
+});
+}
+
+function removeKW(i){
+
+keywords.splice(i,1);
+
+renderTags();
+updateGo();
+}
+
+function updateGo(){
+$('btn-go').disabled=!pdfDoc||!keywords.length;
+}
+
+$('btn-go').addEventListener('click',runSearch);
+
+async function extractText(p){
+
+if(textCacheMap[p])
+return textCacheMap[p];
+
+const page=await pdfDoc.getPage(p);
+
+const tc=await page.getTextContent();
+
+if(tc.items&&tc.items.length){
+
+const vp=page.getViewport({scale:1});
+
+const items=tc.items.filter(i=>i.str).map(i=>{
+
+const tx=pdfjsLib.Util.transform(
+vp.transform,
+i.transform
+);
+
+return{
+str:i.str,
+x:tx[4],
+y:tx[5]-i.height,
+w:i.width,
+h:i.height
+};
+});
+
+textCacheMap[p]=items;
+return items;
+}
+
+if(ocrTextCache[p])
+return ocrTextCache[p];
+
+$('match-label').textContent='Running OCR page '+p;
+
+const viewport=page.getViewport({scale:1.5});
+
+const canvas=document.createElement('canvas');
+
+canvas.width=viewport.width;
+canvas.height=viewport.height;
+
+await page.render({
+canvasContext:canvas.getContext('2d'),
+viewport
+}).promise;
+
+const result=await Tesseract.recognize(
+canvas,
+'eng'
+);
+
+const words=result.data.words||[];
+
+const items=words.map(w=>({
+str:w.text,
+x:w.bbox.x0/1.5,
+y:w.bbox.y0/1.5,
+w:(w.bbox.x1-w.bbox.x0)/1.5,
+h:(w.bbox.y1-w.bbox.y0)/1.5
+}));
+
+ocrTextCache[p]=items;
+
+return items;
+}
+
+async function runSearch(){
+
+allMatches=[];
+clearHighlights();
+
+for(let p=1;p<=pdfDoc.numPages;p++){
+
+const items=await extractText(p);
+
+const full=items.map(i=>i.str).join(' ');
+
+keywords.forEach((kw,ki)=>{
+
+const re=new RegExp(
+kw.text.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'),
+'gi'
+);
+
+let m;
+
+while((m=re.exec(full))!==null){
+
+const rect=findRect(items,m.index);
+
+if(rect){
+
+allMatches.push({
+page:p,
+ki,
+rect
+});
+}
+}
+});
+
+$('prog').style.width=
+((p/pdfDoc.numPages)*100)+'%';
+}
+
+drawHighlights();
+
+if(allMatches.length){
+
+curMatch=0;
+scrollToMatch(curMatch);
+updateMatchLabel();
+}
+
+setTimeout(()=>{
+$('prog').style.width='0';
+},500);
+}
+
+function findRect(items,ms){
+
+let pos=0;
+
+for(const it of items){
+
+const end=pos+it.str.length;
+
+if(pos<=ms&&ms<end)
+return it;
+
+pos=end+1;
+}
+
+return null;
+}
+
+function clearHighlights(){
+
+pageCanvases.forEach(pc=>{
+
+const hc=pc.hlCanvas.getContext('2d');
+
+hc.clearRect(
+0,
+0,
+pc.hlCanvas.width,
+pc.hlCanvas.height
+);
+});
+}
+
+function drawHighlights(){
+
+clearHighlights();
+
+allMatches.forEach((m,idx)=>{
+
+const pc=pageCanvases[m.page-1];
+
+const hc=pc.hlCanvas.getContext('2d');
+
+const kw=keywords[m.ki];
+
+hc.fillStyle=
+idx===curMatch
+? 'rgba(255,0,0,0.6)'
+: kw.color.hl;
+
+hc.fillRect(
+m.rect.x,
+m.rect.y,
+m.rect.w,
+m.rect.h
+);
+});
+}
+
+function scrollToMatch(idx){
+
+const m=allMatches[idx];
+
+if(!m) return;
+
+pageCanvases[m.page-1].wrap.scrollIntoView({
+behavior:'smooth',
+block:'center'
+});
+}
+
+function updateMatchLabel(){
+
+if(!allMatches.length){
+
+$('match-label').textContent='No matches';
+return;
+}
+
+const m=allMatches[curMatch];
+
+$('match-label').textContent=
+keywords[m.ki].text+
+' '+(curMatch+1)+'/'+allMatches.length;
+}
+
+function nav(dir){
+
+if(!allMatches.length) return;
+
+curMatch=
+(curMatch+dir+allMatches.length)
+%allMatches.length;
+
+drawHighlights();
+scrollToMatch(curMatch);
+updateMatchLabel();
+}
+</script>
+
+</body>
+</html>
